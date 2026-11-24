@@ -1,0 +1,33 @@
+[package]
+name = "mdink"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.92"
+description = "A compact, browser-free Markdown-to-PDF CLI written in Rust, with six themes and custom colors"
+
+[[bin]]
+name = "mdink"
+path = "native/main.rs"
+
+[dependencies]
+comrak = { version = "0.55", default-features = false }
+krilla = "0.8"
+krilla-svg = "0.8"
+usvg = "0.47"
+rustybuzz = "0.20"
+image = { version = "0.25", default-features = false, features = ["bmp"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+base64 = "0.22"
+percent-encoding = "2"
+tempfile = "3"
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[dev-dependencies]
+lopdf = { version = "0.47.0", default-features = false }

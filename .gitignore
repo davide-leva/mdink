@@ -1,0 +1,4 @@
+*.pdf
+*.tmp
+target/
+dist/
