@@ -7,6 +7,7 @@ use comrak::{
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Style {
     pub font_override: Option<usize>,
+    pub color: Option<[u8; 3]>,
     pub bold: bool,
     pub italic: bool,
     pub mono: bool,
@@ -38,7 +39,7 @@ pub enum Inline {
 pub enum Block {
     Paragraph(Vec<Inline>),
     Heading(u8, Vec<Inline>),
-    Code(String),
+    Code(String, String),
     Quote(Vec<Block>),
     List {
         start: Option<usize>,
@@ -108,7 +109,14 @@ fn blocks<'a>(node: &'a AstNode<'a>) -> Vec<Block> {
         match &child.data.borrow().value {
             NodeValue::Paragraph => result.push(Block::Paragraph(spans(child))),
             NodeValue::Heading(h) => result.push(Block::Heading(h.level, spans(child))),
-            NodeValue::CodeBlock(code) => result.push(Block::Code(code.literal.clone())),
+            NodeValue::CodeBlock(code) => result.push(Block::Code(
+                code.literal.clone(),
+                code.info
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .to_string(),
+            )),
             NodeValue::HtmlBlock(html) => {
                 let mut text = html.literal.trim();
                 let mut spans = Vec::new();
@@ -223,7 +231,7 @@ mod tests {
         assert!(
             matches!(&result[1], Block::Paragraph(s) if matches!(&s[0], Inline::Text(t, style) if t == "<br />" && style.mono))
         );
-        assert!(matches!(&result[2], Block::Code(s) if s.contains("<br />")));
+        assert!(matches!(&result[2], Block::Code(s, _) if s.contains("<br />")));
         assert!(
             matches!(&result[3], Block::Paragraph(s) if matches!(&s[0], Inline::Text(t, _) if t.contains("<script>")))
         );

@@ -4,11 +4,13 @@ use crate::{
     markdown::{Block, Inline, Style},
     theme::{Color, Theme},
 };
+use base64::{Engine, engine::general_purpose::STANDARD};
 use comrak::nodes::TableAlignment;
 use krilla::{
     Document,
     action::LinkAction,
     annotation::{Annotation, LinkAnnotation, Target},
+    destination::XyzDestination,
     geom::{PathBuilder, Point, Rect, Size, Transform},
     metadata::Metadata,
     page::PageSettings,
@@ -16,7 +18,8 @@ use krilla::{
     text::TextDirection,
 };
 use krilla_svg::{SurfaceExt, SvgSettings};
-use std::path::Path;
+use std::{collections::HashMap, path::Path};
+use syntect::{easy::HighlightLines, highlighting::ThemeSet, parsing::SyntaxSet};
 
 const LEFT: f32 = 54.0;
 const TOP: f32 = 57.0;
@@ -91,6 +94,8 @@ pub struct Layout {
     height: f32,
     y: f32,
     pages: Vec<Vec<Op>>,
+    anchors: HashMap<String, (usize, f32, f32)>,
+    heading_counts: HashMap<String, usize>,
 }
 
 impl Layout {
@@ -110,6 +115,8 @@ impl Layout {
             height,
             y: TOP,
             pages: vec![Vec::new()],
+            anchors: HashMap::new(),
+            heading_counts: HashMap::new(),
         })
     }
 
@@ -272,7 +279,9 @@ impl Layout {
                             self.theme.surface,
                         );
                     }
-                    let color = if style.link.is_some() && inline_bg {
+                    let color = if let Some(color) = style.color {
+                        color
+                    } else if style.link.is_some() && inline_bg {
                         self.theme.accent
                     } else {
                         color
@@ -363,6 +372,16 @@ impl Layout {
                     if self.y > TOP {
                         self.gap(18.0);
                     }
+                    let slug = heading_slug(&spans);
+                    let count = self.heading_counts.entry(slug.clone()).or_default();
+                    let anchor = if *count == 0 {
+                        slug
+                    } else {
+                        format!("{slug}-{count}")
+                    };
+                    *count += 1;
+                    self.anchors
+                        .insert(anchor, (self.pages.len() - 1, left, self.y));
                     for mut line in lines {
                         line.height = size * 1.3;
                         self.ensure(line.height + 24.0);
@@ -387,19 +406,56 @@ impl Layout {
                         self.gap(7.0);
                     }
                 }
-                Block::Code(code) => {
+                Block::Code(code, language) => {
+                    if language.eq_ignore_ascii_case("mermaid") {
+                        let svg = mermaid_rs_renderer::render_strict(
+                            code,
+                            mermaid_rs_renderer::RenderOptions::default(),
+                        )
+                        .map_err(|e| format!("Invalid or unsupported Mermaid diagram: {e}"))?;
+                        let src = format!("data:image/svg+xml;base64,{}", STANDARD.encode(svg));
+                        self.paragraph(&[Inline::Image(src)], left, right, SIZE, self.theme.text)?;
+                        continue;
+                    }
+                    let syntaxes = SyntaxSet::load_defaults_newlines();
+                    let themes = ThemeSet::load_defaults();
+                    let syntax = syntaxes.find_syntax_by_token(language);
+                    let mut highlighter = syntax.map(|syntax| {
+                        HighlightLines::new(syntax, &themes.themes["base16-ocean.light"])
+                    });
                     let mut spans = Vec::new();
                     for (i, line) in code.trim_end_matches('\n').split('\n').enumerate() {
                         if i > 0 {
                             spans.push(Inline::Break);
                         }
-                        spans.push(Inline::Text(
-                            line.into(),
-                            Style {
-                                mono: true,
-                                ..Default::default()
-                            },
-                        ));
+                        if let Some(ref mut highlighter) = highlighter {
+                            let with_newline = format!("{line}\n");
+                            let highlighted = highlighter
+                                .highlight_line(&with_newline, &syntaxes)
+                                .map_err(|e| format!("Unable to highlight code: {e}"))?;
+                            for (color, text) in highlighted {
+                                spans.push(Inline::Text(
+                                    text.trim_end_matches('\n').into(),
+                                    Style {
+                                        mono: true,
+                                        color: Some([
+                                            color.foreground.r,
+                                            color.foreground.g,
+                                            color.foreground.b,
+                                        ]),
+                                        ..Default::default()
+                                    },
+                                ));
+                            }
+                        } else {
+                            spans.push(Inline::Text(
+                                line.into(),
+                                Style {
+                                    mono: true,
+                                    ..Default::default()
+                                },
+                            ));
+                        }
                     }
                     let lines = self.wrap(&spans, self.width - left - right - 24.0, SIZE, true)?;
                     self.ensure(24.0 + lines.first().map_or(0.0, |l| l.height));
@@ -695,11 +751,7 @@ impl Layout {
                             false,
                             TextDirection::Auto,
                         );
-                        if let Some(url) = &style.link
-                            && (url.starts_with("https://")
-                                || url.starts_with("http://")
-                                || url.starts_with("mailto:"))
-                        {
+                        if let Some(url) = &style.link {
                             links.push((
                                 Rect::from_xywh(*x, y - size, *width, size * 1.35).unwrap(),
                                 url.clone(),
@@ -746,10 +798,26 @@ impl Layout {
             );
             surface.finish();
             for (rect, url) in links {
-                page.add_annotation(Annotation::new_link(
-                    LinkAnnotation::new(rect, Target::Action(LinkAction::new(url).into())),
-                    None,
-                ));
+                let target = if let Some(fragment) = url.strip_prefix('#') {
+                    let decoded =
+                        percent_encoding::percent_decode_str(fragment).decode_utf8_lossy();
+                    self.anchors.get(decoded.as_ref()).map(|&(page, x, y)| {
+                        Target::Destination(XyzDestination::new(page, Point::from_xy(x, y)).into())
+                    })
+                } else if url.starts_with("https://")
+                    || url.starts_with("http://")
+                    || url.starts_with("mailto:")
+                {
+                    Some(Target::Action(LinkAction::new(url).into()))
+                } else {
+                    None
+                };
+                if let Some(target) = target {
+                    page.add_annotation(Annotation::new_link(
+                        LinkAnnotation::new(rect, target),
+                        None,
+                    ));
+                }
             }
             page.finish();
         }
@@ -770,4 +838,26 @@ fn fill(color: Color) -> Fill {
         paint: krilla::color::rgb::Color::new(color[0], color[1], color[2]).into(),
         ..Default::default()
     }
+}
+
+fn heading_slug(spans: &[Inline]) -> String {
+    let text: String = spans
+        .iter()
+        .filter_map(|s| match s {
+            Inline::Text(t, _) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect();
+    text.to_lowercase()
+        .chars()
+        .filter_map(|c| {
+            if c.is_alphanumeric() || c == '_' || c == '-' {
+                Some(c)
+            } else if c.is_whitespace() {
+                Some('-')
+            } else {
+                None
+            }
+        })
+        .collect()
 }

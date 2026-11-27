@@ -254,7 +254,15 @@ fn br_tags_break_paragraphs_and_tables_but_remain_literal_in_code() {
         assert!((a.y - b.y).abs() > 1.0, "Expected a new line: {a:?}, {b:?}");
     }
     let content = all_text(&pdf);
-    assert_eq!(content.matches("<br />").count(), 2);
+    assert!(content.contains("<br />"));
+    assert_eq!(
+        runs.iter()
+            .map(|r| r.text.as_str())
+            .collect::<String>()
+            .matches("<br />")
+            .count(),
+        2
+    );
     assert!(
         runs.iter()
             .map(|r| r.text.as_str())
@@ -509,4 +517,56 @@ fn cli_help_version_errors_and_output_protection_are_english() {
         );
     }
     assert_eq!(fs::read_to_string(input).unwrap(), "# Test");
+}
+
+#[test]
+fn syntax_diagrams_and_internal_links_work_in_pdf() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("features.md");
+    fs::write(&input, format!("[Go](#sezione-%C3%A8) [Again](#sezione-%C3%A8-1)\n\n```rust\nlet answer = 42; // comment\n```\n\n```unknownlang\nplain text\n```\n\n```mermaid\nflowchart LR\n A[Start] --> B[Finish]\n```\n\n{}\n\n# Sezione è\n\n# Sezione è\n", "paragraph\n\n".repeat(70))).unwrap();
+    let pdf = convert(&input, &[]);
+    let pages = pdf.get_pages();
+    assert!(pages.len() > 1);
+    let annotations = pdf.get_page_annotations(pages[&1]).unwrap();
+    assert_eq!(annotations.len(), 2);
+    for annotation in annotations {
+        let dest = object(&pdf, annotation.get(b"Dest").unwrap())
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            dest[0].as_reference().unwrap(),
+            *pages.values().last().unwrap()
+        );
+    }
+    let content = all_text(&pdf);
+    assert!(content.contains("answer"));
+    assert!(content.contains("plain text"));
+    assert!(!content.contains("flowchart LR"));
+    let ops = pdf.get_and_decode_page_content(pages[&1]).unwrap();
+    let colors: BTreeSet<_> = ops
+        .operations
+        .iter()
+        .filter(|o| o.operator == "rg")
+        .map(|o| format!("{:?}", o.operands))
+        .collect();
+    assert!(colors.len() >= 4);
+    assert!(!ops.operations.is_empty());
+}
+
+#[test]
+fn invalid_mermaid_preserves_existing_pdf() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("invalid.md");
+    fs::write(&input, "# Existing").unwrap();
+    convert(&input, &[]);
+    let previous = fs::read(input.with_extension("pdf")).unwrap();
+    fs::write(
+        &input,
+        "```mermaid\nflowchart TD\nsubgraph broken\nA --> B\n```\n",
+    )
+    .unwrap();
+    let output = command().arg(&input).output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Mermaid"));
+    assert_eq!(fs::read(input.with_extension("pdf")).unwrap(), previous);
 }
