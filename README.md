@@ -81,6 +81,22 @@ Headings, accents, borders, alternating table rows, code and quote backgrounds, 
 
 Use a six-digit hexadecimal color, with or without `#`. Quote values containing `#` in the shell. If both `--theme` and `--color` are provided, the custom color determines the entire palette.
 
+## Optional document features
+
+Each feature is disabled unless its flag is supplied:
+
+- `--toc` inserts a clickable table of contents with page numbers for level 1 and 2 headings; level 2 entries are indented.
+- `--bookmarks` adds hierarchical PDF bookmarks for headings.
+- `--page-breaks` interprets a standalone `<!-- pagebreak -->` line as a page break. Without the flag it remains literal text.
+- `--header "Text"` adds a centered header. `--footer "Page {page} of {pages}"` replaces the default page-number footer; placeholders are expanded per page. Text must fit on one line.
+- `--code-theme dark` selects a dark syntax-highlighting palette and background. `--code-theme light` selects the default palette.
+
+For example:
+
+```sh
+mdink report.md --toc --bookmarks --page-breaks --header "Project report" --footer "Page {page} of {pages}" --code-theme dark
+```
+
 ## Supported Markdown
 
 - H1–H6 headings, paragraphs, bold, italic and combined emphasis.

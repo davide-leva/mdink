@@ -13,6 +13,7 @@ use krilla::{
     destination::XyzDestination,
     geom::{PathBuilder, Point, Rect, Size, Transform},
     metadata::Metadata,
+    outline::{Outline, OutlineNode},
     page::PageSettings,
     paint::Fill,
     text::TextDirection,
@@ -61,6 +62,13 @@ impl Line {
 }
 
 enum Op {
+    Link {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        url: String,
+    },
     Text {
         text: String,
         style: Style,
@@ -86,7 +94,28 @@ enum Op {
     },
 }
 
+#[derive(Clone, Default)]
+pub struct LayoutOptions {
+    pub bookmarks: bool,
+    pub page_breaks: bool,
+    pub header: Option<String>,
+    pub footer: Option<String>,
+    pub dark_code: bool,
+}
+
+#[derive(Clone, PartialEq)]
+pub struct HeadingEntry {
+    level: u8,
+    title: String,
+    anchor: String,
+    page: usize,
+    x: f32,
+    y: f32,
+}
+
 pub struct Layout {
+    options: LayoutOptions,
+    headings: Vec<HeadingEntry>,
     fonts: Fonts,
     assets: Assets,
     theme: Theme,
@@ -99,7 +128,7 @@ pub struct Layout {
 }
 
 impl Layout {
-    pub fn new(base: &Path, landscape: bool, theme: Theme) -> Result<Self> {
+    pub fn new(base: &Path, landscape: bool, theme: Theme, options: LayoutOptions) -> Result<Self> {
         let fonts = Fonts::new()?;
         let assets = Assets::new(base, &fonts);
         let (width, height) = if landscape {
@@ -108,6 +137,8 @@ impl Layout {
             (595.28, 841.89)
         };
         Ok(Self {
+            options,
+            headings: Vec::new(),
             fonts,
             assets,
             theme,
@@ -267,7 +298,37 @@ impl Layout {
 
     fn draw_line(&mut self, line: &Line, x: f32, y: f32, color: Color, inline_bg: bool) {
         let mut cursor = x;
+        let mut link: Option<(String, f32, f32, f32, f32)> = None;
+        let mut link_ops = Vec::new();
         for piece in &line.pieces {
+            let url = match &piece.kind {
+                Kind::Text(_, style) => style.link.as_deref(),
+                _ => None,
+            };
+            if link
+                .as_ref()
+                .is_some_and(|(current, ..)| Some(current.as_str()) != url)
+            {
+                let (url, x1, y1, x2, y2) = link.take().unwrap();
+                link_ops.push(Op::Link {
+                    x: x1,
+                    y: y1,
+                    w: x2 - x1,
+                    h: y2 - y1,
+                    url,
+                });
+            }
+            if let Some(url) = url.filter(|_| piece.width > 0.0) {
+                let top = y + piece.size * 0.12;
+                let bottom = top + piece.size * 1.35;
+                if let Some((_, _, y1, x2, y2)) = &mut link {
+                    *y1 = y1.min(top);
+                    *x2 = cursor + piece.width;
+                    *y2 = y2.max(bottom);
+                } else {
+                    link = Some((url.to_string(), cursor, top, cursor + piece.width, bottom));
+                }
+            }
             match &piece.kind {
                 Kind::Text(text, style) => {
                     if style.mono && inline_bg {
@@ -306,6 +367,18 @@ impl Layout {
             }
             cursor += piece.width;
         }
+        if let Some((url, x1, y1, x2, y2)) = link {
+            link_ops.push(Op::Link {
+                x: x1,
+                y: y1,
+                w: x2 - x1,
+                h: y2 - y1,
+                url,
+            });
+        }
+        for op in link_ops {
+            self.op(op);
+        }
     }
 
     fn paragraph(
@@ -332,6 +405,44 @@ impl Layout {
             self.y += line.height;
         }
         self.gap(8.0);
+        Ok(())
+    }
+
+    pub fn headings(&self) -> &[HeadingEntry] {
+        &self.headings
+    }
+
+    pub fn render_toc(&mut self, entries: &[HeadingEntry]) -> Result<()> {
+        self.paragraph(
+            &[Inline::Text(
+                "Contents".into(),
+                Style {
+                    bold: true,
+                    ..Default::default()
+                },
+            )],
+            LEFT,
+            LEFT,
+            19.0,
+            self.theme.heading,
+        )?;
+        for entry in entries.iter().filter(|entry| entry.level <= 2) {
+            let label = format!("{}  ·  {}", entry.title, entry.page + 1);
+            self.paragraph(
+                &[Inline::Text(
+                    label,
+                    Style {
+                        link: Some(format!("#{}", entry.anchor)),
+                        ..Default::default()
+                    },
+                )],
+                LEFT + if entry.level == 2 { 20.0 } else { 0.0 },
+                LEFT,
+                SIZE,
+                self.theme.text,
+            )?;
+        }
+        self.new_page();
         Ok(())
     }
 
@@ -380,8 +491,17 @@ impl Layout {
                         format!("{slug}-{count}")
                     };
                     *count += 1;
-                    self.anchors
-                        .insert(anchor, (self.pages.len() - 1, left, self.y));
+                    let title = heading_text(&spans);
+                    let page = self.pages.len() - 1;
+                    self.headings.push(HeadingEntry {
+                        level: *level,
+                        title,
+                        anchor: anchor.clone(),
+                        page,
+                        x: left,
+                        y: self.y,
+                    });
+                    self.anchors.insert(anchor, (page, left, self.y));
                     for mut line in lines {
                         line.height = size * 1.3;
                         self.ensure(line.height + 24.0);
@@ -421,7 +541,14 @@ impl Layout {
                     let themes = ThemeSet::load_defaults();
                     let syntax = syntaxes.find_syntax_by_token(language);
                     let mut highlighter = syntax.map(|syntax| {
-                        HighlightLines::new(syntax, &themes.themes["base16-ocean.light"])
+                        HighlightLines::new(
+                            syntax,
+                            &themes.themes[if self.options.dark_code {
+                                "base16-ocean.dark"
+                            } else {
+                                "base16-ocean.light"
+                            }],
+                        )
                     });
                     let mut spans = Vec::new();
                     for (i, line) in code.trim_end_matches('\n').split('\n').enumerate() {
@@ -464,7 +591,11 @@ impl Layout {
                         self.y,
                         self.width - left - right,
                         10.0,
-                        self.theme.surface,
+                        if self.options.dark_code {
+                            [43, 48, 59]
+                        } else {
+                            self.theme.surface
+                        },
                     );
                     self.y += 10.0;
                     for line in lines {
@@ -474,9 +605,23 @@ impl Layout {
                             self.y,
                             self.width - left - right,
                             line.height,
-                            self.theme.surface,
+                            if self.options.dark_code {
+                                [43, 48, 59]
+                            } else {
+                                self.theme.surface
+                            },
                         );
-                        self.draw_line(&line, left + 12.0, self.y, self.theme.text, false);
+                        self.draw_line(
+                            &line,
+                            left + 12.0,
+                            self.y,
+                            if self.options.dark_code {
+                                [220, 225, 230]
+                            } else {
+                                self.theme.text
+                            },
+                            false,
+                        );
                         self.y += line.height;
                     }
                     self.ensure(10.0);
@@ -485,9 +630,28 @@ impl Layout {
                         self.y,
                         self.width - left - right,
                         10.0,
-                        self.theme.surface,
+                        if self.options.dark_code {
+                            [43, 48, 59]
+                        } else {
+                            self.theme.surface
+                        },
                     );
                     self.y += 18.0;
+                }
+                Block::PageBreak => {
+                    if self.options.page_breaks {
+                        if self.y > TOP {
+                            self.new_page();
+                        }
+                    } else {
+                        self.paragraph(
+                            &[Inline::Text("<!-- pagebreak -->".into(), Style::default())],
+                            left,
+                            right,
+                            SIZE,
+                            self.theme.text,
+                        )?;
+                    }
                 }
                 Block::Rule => {
                     self.ensure(22.0);
@@ -711,7 +875,52 @@ impl Layout {
                 .language("it".into())
                 .creator("mdink (native)".into()),
         );
+        if self.options.bookmarks {
+            fn children(
+                entries: &[HeadingEntry],
+                pos: &mut usize,
+                parent_level: u8,
+            ) -> Vec<OutlineNode> {
+                let mut nodes = Vec::new();
+                while *pos < entries.len() && entries[*pos].level > parent_level {
+                    let e = &entries[*pos];
+                    *pos += 1;
+                    let mut node = OutlineNode::new(
+                        e.title.clone(),
+                        XyzDestination::new(e.page, Point::from_xy(e.x, e.y)),
+                    );
+                    for child in children(entries, pos, e.level) {
+                        node.push_child(child);
+                    }
+                    nodes.push(node);
+                }
+                nodes
+            }
+            let mut outline = Outline::new();
+            for node in children(&self.headings, &mut 0, 0) {
+                outline.push_child(node);
+            }
+            doc.set_outline(outline);
+        }
         let total = self.pages.len();
+        for text in self.options.header.iter().chain(self.options.footer.iter()) {
+            let sample = text
+                .replace("{page}", &total.to_string())
+                .replace("{pages}", &total.to_string());
+            if sample.contains(['\n', '\r'])
+                || self
+                    .fonts
+                    .runs(&sample, 0)?
+                    .iter()
+                    .any(|(_, font)| *font != 0)
+                || self.fonts.width(&sample, 0, 8.0) > self.width - 2.0 * LEFT
+            {
+                return Err(
+                    "Header or footer contains unsupported characters or is too wide for the page"
+                        .into(),
+                );
+            }
+        }
         for (index, ops) in self.pages.iter().enumerate() {
             let mut page =
                 doc.start_page_with(PageSettings::from_wh(self.width, self.height).unwrap());
@@ -719,6 +928,11 @@ impl Layout {
             let mut surface = page.surface();
             for op in ops {
                 match op {
+                    Op::Link { x, y, w, h, url } => {
+                        if let Some(rect) = Rect::from_xywh(*x, *y, *w, *h) {
+                            links.push((rect, url.clone()));
+                        }
+                    }
                     Op::Rect { x, y, w, h, color } => {
                         let mut path = PathBuilder::new();
                         path.move_to(*x, *y);
@@ -751,12 +965,6 @@ impl Layout {
                             false,
                             TextDirection::Auto,
                         );
-                        if let Some(url) = &style.link {
-                            links.push((
-                                Rect::from_xywh(*x, y - size, *width, size * 1.35).unwrap(),
-                                url.clone(),
-                            ));
-                        }
                         if style.strike || style.link.is_some() {
                             let y = if style.strike {
                                 y - size * 0.3
@@ -785,7 +993,25 @@ impl Layout {
                     }
                 }
             }
-            let footer = format!("{} / {total}", index + 1);
+            if let Some(header) = &self.options.header {
+                let width = self.fonts.width(header, 0, 8.0);
+                surface.set_fill(Some(fill(self.theme.muted)));
+                surface.draw_text(
+                    Point::from_xy(((self.width - width) / 2.0).max(LEFT), 28.0),
+                    self.fonts.fonts[0].clone(),
+                    8.0,
+                    header,
+                    false,
+                    TextDirection::Auto,
+                );
+            }
+            let footer = self
+                .options
+                .footer
+                .as_deref()
+                .unwrap_or("{page} / {pages}")
+                .replace("{page}", &(index + 1).to_string())
+                .replace("{pages}", &total.to_string());
             let width = self.fonts.width(&footer, 0, 8.0);
             surface.set_fill(Some(fill(self.theme.muted)));
             surface.draw_text(
@@ -840,15 +1066,19 @@ fn fill(color: Color) -> Fill {
     }
 }
 
-fn heading_slug(spans: &[Inline]) -> String {
-    let text: String = spans
+fn heading_text(spans: &[Inline]) -> String {
+    spans
         .iter()
         .filter_map(|s| match s {
             Inline::Text(t, _) => Some(t.as_str()),
             _ => None,
         })
-        .collect();
-    text.to_lowercase()
+        .collect()
+}
+
+fn heading_slug(spans: &[Inline]) -> String {
+    heading_text(spans)
+        .to_lowercase()
         .chars()
         .filter_map(|c| {
             if c.is_alphanumeric() || c == '_' || c == '-' {

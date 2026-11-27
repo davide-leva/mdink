@@ -480,7 +480,7 @@ fn jpeg_gif_webp_and_bmp_codecs() {
 fn cli_help_version_errors_and_output_protection_are_english() {
     let dir = tempfile::tempdir().unwrap();
     assert!(success(run(&["--help"])).contains("Usage: mdink"));
-    assert_eq!(success(run(&["--version"])).trim(), "1.0.0");
+    assert_eq!(success(run(&["--version"])).trim(), env!("CARGO_PKG_VERSION"));
     let input = dir.path().join("input.md");
     fs::write(&input, "# Test").unwrap();
     assert!(success(command().arg(&input).output().unwrap()).starts_with("PDF created:"));
@@ -569,4 +569,136 @@ fn invalid_mermaid_preserves_existing_pdf() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("Mermaid"));
     assert_eq!(fs::read(input.with_extension("pdf")).unwrap(), previous);
+}
+
+#[test]
+fn optional_navigation_page_breaks_and_page_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("options.md");
+    fs::write(
+        &input,
+        "# First\n\nIntro.\n\n<!-- pagebreak -->\n\n## Second\n\nBody.\n",
+    )
+    .unwrap();
+    let default = convert(&input, &[]);
+    assert_eq!(default.get_pages().len(), 1);
+    assert!(
+        !object(&default, default.trailer.get(b"Root").unwrap())
+            .as_dict()
+            .unwrap()
+            .has(b"Outlines")
+    );
+    let pdf = convert(
+        &input,
+        &[
+            "--toc",
+            "--bookmarks",
+            "--page-breaks",
+            "--header",
+            "My header",
+            "--footer",
+            "Page {page} of {pages}",
+        ],
+    );
+    let pages = pdf.get_pages();
+    assert_eq!(pages.len(), 3);
+    let contents = text(&pdf, &[1]);
+    assert!(
+        contents.contains("Contents") && contents.contains("First") && contents.contains("Second")
+    );
+    assert!(contents.contains("Page 1 of 3"));
+    assert!(text(&pdf, &[2]).contains("My header"));
+    assert!(text(&pdf, &[3]).contains("Page 3 of 3"));
+    let annotations = pdf.get_page_annotations(pages[&1]).unwrap();
+    let destinations: BTreeSet<_> = annotations
+        .iter()
+        .map(|annotation| {
+            let dest = object(&pdf, annotation.get(b"Dest").unwrap())
+                .as_array()
+                .unwrap();
+            dest[0].as_reference().unwrap()
+        })
+        .collect();
+    assert_eq!(destinations, [pages[&2], pages[&3]].into_iter().collect());
+    let catalog = object(&pdf, pdf.trailer.get(b"Root").unwrap())
+        .as_dict()
+        .unwrap();
+    let outline = object(&pdf, catalog.get(b"Outlines").unwrap())
+        .as_dict()
+        .unwrap();
+    let first = object(&pdf, outline.get(b"First").unwrap())
+        .as_dict()
+        .unwrap();
+    assert_eq!(
+        lopdf::decode_text_string(first.get(b"Title").unwrap()).unwrap(),
+        "First"
+    );
+    let child = object(&pdf, first.get(b"First").unwrap())
+        .as_dict()
+        .unwrap();
+    assert_eq!(
+        lopdf::decode_text_string(child.get(b"Title").unwrap()).unwrap(),
+        "Second"
+    );
+}
+
+#[test]
+fn code_theme_is_optional_and_rejects_unknown_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("code.md");
+    fs::write(&input, "```rust\nlet count = 42;\n```\n").unwrap();
+    let light = convert(&input, &[]);
+    let dark = convert(&input, &["--code-theme", "dark"]);
+    let colors = |pdf: &Document| {
+        pdf.get_and_decode_page_content(pdf.get_pages()[&1])
+            .unwrap()
+            .operations
+            .into_iter()
+            .filter(|op| op.operator == "rg")
+            .map(|op| format!("{:?}", op.operands))
+            .collect::<BTreeSet<_>>()
+    };
+    assert_ne!(colors(&light), colors(&dark));
+    assert!(
+        !command()
+            .arg(&input)
+            .args(["--code-theme", "unknown"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn contents_indent_second_level_and_links_cover_whole_lines() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("links.md");
+    fs::write(&input, format!("# First heading\n\n## Second heading\n\n### Hidden from contents\n\n[A **multi word** link](https://example.com)\n\n[{}](https://example.org)\n", "A long link ".repeat(12))).unwrap();
+    let pdf = convert(&input, &["--toc"]);
+    let pages = pdf.get_pages();
+    let contents = text(&pdf, &[1]);
+    assert!(!contents.contains("Hidden from contents"));
+    let runs = text_runs(&pdf, pages[&1]);
+    let first = runs.iter().find(|run| run.text == "First").unwrap();
+    let second = runs.iter().find(|run| run.text == "Second").unwrap();
+    assert!(second.x >= first.x + 19.0);
+    assert_eq!(pdf.get_page_annotations(pages[&1]).unwrap().len(), 2);
+    let links = pdf.get_page_annotations(pages[&2]).unwrap();
+    let example_count = links
+        .iter()
+        .filter(|a| {
+            let action = object(&pdf, a.get(b"A").unwrap()).as_dict().unwrap();
+            action.get(b"URI").unwrap().as_str().unwrap() == b"https://example.com"
+        })
+        .count();
+    let wrapped_count = links
+        .iter()
+        .filter(|a| {
+            let action = object(&pdf, a.get(b"A").unwrap()).as_dict().unwrap();
+            action.get(b"URI").unwrap().as_str().unwrap() == b"https://example.org"
+        })
+        .count();
+    assert_eq!(example_count, 1);
+    assert!(wrapped_count > 1 && wrapped_count < 6);
 }

@@ -47,6 +47,7 @@ pub enum Block {
     },
     Table(Vec<TableAlignment>, Vec<Vec<Vec<Inline>>>),
     Rule,
+    PageBreak,
 }
 
 fn line_break_tag(s: &str) -> bool {
@@ -117,6 +118,14 @@ fn blocks<'a>(node: &'a AstNode<'a>) -> Vec<Block> {
                     .unwrap_or("")
                     .to_string(),
             )),
+            NodeValue::HtmlBlock(html)
+                if html
+                    .literal
+                    .trim()
+                    .eq_ignore_ascii_case("<!-- pagebreak -->") =>
+            {
+                result.push(Block::PageBreak)
+            }
             NodeValue::HtmlBlock(html) => {
                 let mut text = html.literal.trim();
                 let mut spans = Vec::new();

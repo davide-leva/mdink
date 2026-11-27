@@ -17,6 +17,12 @@ Convert Markdown to A4 PDF. No browser or Node.js required.
       --theme <name>     Color theme (default: ocean)
       --color <#RRGGBB>  Custom primary color
       --list-themes      List the six available themes
+      --toc              Add a clickable table of contents
+      --bookmarks        Add PDF bookmarks for headings
+      --page-breaks      Enable <!-- pagebreak --> markers
+      --header <text>    Add a header to each page
+      --footer <text>    Set the footer ({page} and {pages} are replaced)
+      --code-theme <name> Syntax theme: light or dark
   -h, --help             Show this help message
   -v, --version          Show the version";
 
@@ -28,6 +34,8 @@ fn run() -> Result<()> {
     let mut theme_name = String::from("ocean");
     let mut color = None;
     let mut positional = false;
+    let mut options = layout::LayoutOptions::default();
+    let mut toc = false;
     let mut args = env::args_os().skip(1);
     while let Some(arg) = args.next() {
         if !positional {
@@ -43,6 +51,36 @@ fn run() -> Result<()> {
                 Some("-v" | "--version") => {
                     println!("{}", env!("CARGO_PKG_VERSION"));
                     return Ok(());
+                }
+                Some("--toc") => {
+                    toc = true;
+                    continue;
+                }
+                Some("--bookmarks") => {
+                    options.bookmarks = true;
+                    continue;
+                }
+                Some("--page-breaks") => {
+                    options.page_breaks = true;
+                    continue;
+                }
+                Some("--header" | "--footer" | "--code-theme") => {
+                    let name = arg.to_str().unwrap();
+                    let value = args
+                        .next()
+                        .ok_or_else(|| format!("Missing value after {name}"))?
+                        .into_string()
+                        .map_err(|_| format!("Value for {name} must be valid UTF-8"))?;
+                    match name {
+                        "--header" => options.header = Some(value),
+                        "--footer" => options.footer = Some(value),
+                        _ => match value.as_str() {
+                            "light" => options.dark_code = false,
+                            "dark" => options.dark_code = true,
+                            _ => return Err("Unknown code theme (choose light or dark)".into()),
+                        },
+                    }
+                    continue;
                 }
                 Some("--landscape") => {
                     landscape = true;
@@ -118,8 +156,29 @@ fn run() -> Result<()> {
     let source = fs::read_to_string(&input)?;
     let blocks = markdown::parse(&source);
     let theme = theme::Theme::new(&theme_name, color.as_deref())?;
-    let mut renderer = layout::Layout::new(input.parent().unwrap(), landscape, theme)?;
-    renderer.render(&blocks)?;
+    let mut entries = Vec::new();
+    let mut passes = 0;
+    let renderer = loop {
+        passes += 1;
+        if passes > 12 {
+            return Err("Table of contents pagination did not converge".into());
+        }
+        let mut renderer = layout::Layout::new(
+            input.parent().unwrap(),
+            landscape,
+            theme.clone(),
+            options.clone(),
+        )?;
+        if toc && !entries.is_empty() {
+            renderer.render_toc(&entries)?;
+        }
+        renderer.render(&blocks)?;
+        let next = renderer.headings().to_vec();
+        if !toc || next == entries {
+            break renderer;
+        }
+        entries = next;
+    };
     let pdf = renderer.finish(&title)?;
     let parent = output.parent().ok_or("Invalid output path")?;
     fs::create_dir_all(parent)?;
